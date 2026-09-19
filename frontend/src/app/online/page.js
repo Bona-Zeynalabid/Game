@@ -1,10 +1,10 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import Button from '@/components/Button';
 import Avatar from '@/components/Avatar';
-import { Swords, Check, X, Loader2 } from 'lucide-react';
+import { Swords, Check, X, Loader2, WifiOff, AlertTriangle } from 'lucide-react';
 import { initializeSocket } from '@/lib/socket';
 import OnlineBoard from '@/components/OnlineBoard';
 
@@ -16,6 +16,8 @@ export default function OnlinePage() {
   const [challengePending, setChallengePending] = useState(false);
   const [message, setMessage] = useState('');
   const [connectionError, setConnectionError] = useState('');
+  const [networkWarning, setNetworkWarning] = useState('');
+  const [isConnected, setIsConnected] = useState(false);
   const [gameActive, setGameActive] = useState(false);
   const [gameData, setGameData] = useState(null);
   const router = useRouter();
@@ -23,9 +25,17 @@ export default function OnlinePage() {
   useEffect(() => {
     let mounted = true;
     let s;
+    let slowTimer;
 
     async function connect() {
       try {
+        // Slow connection warning after 5 seconds
+        slowTimer = setTimeout(() => {
+          if (mounted && !isConnected) {
+            setNetworkWarning('Network seems slow. Still connecting...');
+          }
+        }, 5000);
+
         const res = await fetch('/api/socket-token');
         if (!res.ok) {
           router.push('/login');
@@ -41,81 +51,102 @@ export default function OnlinePage() {
         if (!mounted) return;
         setSocket(s);
 
-        s.on('connect', () => {
+        // Register listeners BEFORE anything else
+        const onConnect = () => {
+          setIsConnected(true);
           setConnectionError('');
-          console.log('Socket connected');
-        });
+          setNetworkWarning('');
+          clearTimeout(slowTimer);
+          // Ask server for current state
+          s.emit('requestState', (state) => {
+            if (!mounted) return;
+            setMyId(state.yourId);
+            setOnlineUsers(state.onlineUsers);
+          });
+        };
 
-        s.on('connect_error', (err) => {
-          console.error('Socket connection error:', err.message);
-          setConnectionError('Failed to connect to game server');
-        });
+        const onDisconnect = () => {
+          setIsConnected(false);
+          setNetworkWarning('Connection lost. Reconnecting...');
+        };
 
-        s.on('yourId', (id) => {
-          setMyId(id);
-        });
+        const onConnectError = (err) => {
+          setIsConnected(false);
+          setNetworkWarning('');
+          setConnectionError('Cannot connect to game server. Retrying...');
+        };
 
-        s.on('onlineUsers', (users) => {
-          console.log('Received online users:', users);
-          setOnlineUsers(users);
-        });
+        const onOnlineUsers = (users) => setOnlineUsers(users);
 
-        s.on('challengeReceived', (data) => {
-          setIncomingChallenge(data);
-        });
+        const onChallengeReceived = (data) => setIncomingChallenge(data);
 
-        s.on('challengeDeclined', () => {
+        const onChallengeDeclined = () => {
           setChallengePending(false);
           setMessage('Challenge declined');
           setTimeout(() => setMessage(''), 3000);
-        });
+        };
 
-        s.on('challengeExpired', () => {
+        const onChallengeExpired = () => {
           setChallengePending(false);
-          setMessage('Challenge expired');
+          setMessage('Challenge expired or opponent offline');
           setTimeout(() => setMessage(''), 3000);
-        });
+        };
 
-        s.on('gameStart', (data) => {
+        const onGameStart = (data) => {
           setChallengePending(false);
           setGameData(data);
           setGameActive(true);
           setIncomingChallenge(null);
           setMessage('');
-        });
+        };
+
+        s.on('connect', onConnect);
+        s.on('disconnect', onDisconnect);
+        s.on('connect_error', onConnectError);
+        s.on('onlineUsers', onOnlineUsers);
+        s.on('challengeReceived', onChallengeReceived);
+        s.on('challengeDeclined', onChallengeDeclined);
+        s.on('challengeExpired', onChallengeExpired);
+        s.on('gameStart', onGameStart);
+
+        // If already connected, run onConnect manually
+        if (s.connected) onConnect();
+
+        return () => {
+          clearTimeout(slowTimer);
+          s.off('connect', onConnect);
+          s.off('disconnect', onDisconnect);
+          s.off('connect_error', onConnectError);
+          s.off('onlineUsers', onOnlineUsers);
+          s.off('challengeReceived', onChallengeReceived);
+          s.off('challengeDeclined', onChallengeDeclined);
+          s.off('challengeExpired', onChallengeExpired);
+          s.off('gameStart', onGameStart);
+        };
       } catch (err) {
         console.error('Socket setup error:', err);
         setConnectionError('Error connecting to server');
       }
     }
 
-    connect();
+    let cleanup;
+    connect().then((fn) => {
+      cleanup = fn;
+    });
 
     return () => {
       mounted = false;
-      if (s) {
-        s.off('connect');
-        s.off('connect_error');
-        s.off('yourId');
-        s.off('onlineUsers');
-        s.off('challengeReceived');
-        s.off('challengeDeclined');
-        s.off('challengeExpired');
-        s.off('gameStart');
-      }
+      clearTimeout(slowTimer);
+      if (typeof cleanup === 'function') cleanup();
     };
   }, [router]);
 
   const challengeUser = (targetUserId) => {
-    if (socket) {
-      socket.emit('challenge', { targetUserId }, (res) => {
-        if (res?.error) {
-          setMessage(res.error);
-        } else {
-          setChallengePending(true);
-        }
-      });
-    }
+    if (!socket) return;
+    socket.emit('challenge', { targetUserId }, (res) => {
+      if (res?.error) setMessage(res.error);
+      else setChallengePending(true);
+    });
   };
 
   const respondToChallenge = (accept) => {
@@ -159,6 +190,21 @@ export default function OnlinePage() {
     <div className="max-w-4xl mx-auto">
       <h2 className="text-3xl font-bold mb-8 text-center">Online Players</h2>
 
+      {/* Connection status bar */}
+      {!isConnected && (
+        <div className="mb-4 p-3 bg-amber-500/10 border border-amber-500 text-amber-400 rounded-lg flex items-center gap-2">
+          <WifiOff className="w-4 h-4 animate-pulse" />
+          {networkWarning || 'Connecting...'}
+        </div>
+      )}
+
+      {networkWarning && isConnected && (
+        <div className="mb-4 p-3 bg-amber-500/10 border border-amber-500 text-amber-400 rounded-lg flex items-center gap-2">
+          <AlertTriangle className="w-4 h-4" />
+          {networkWarning}
+        </div>
+      )}
+
       {connectionError && (
         <div className="mb-4 p-3 bg-red-500/10 border border-red-500 text-red-400 rounded">
           {connectionError}
@@ -201,11 +247,13 @@ export default function OnlinePage() {
       )}
 
       <div className="space-y-3">
-        {onlineUsers.filter(user => user.id !== myId).length === 0 ? (
-          <p className="text-center text-gray-400">No other players online</p>
+        {onlineUsers.filter((u) => u.id !== myId).length === 0 ? (
+          <p className="text-center text-gray-400">
+            {isConnected ? 'No other players online' : 'Loading players...'}
+          </p>
         ) : (
           onlineUsers
-            .filter(user => user.id !== myId)
+            .filter((u) => u.id !== myId)
             .map((user) => (
               <div
                 key={user.id}

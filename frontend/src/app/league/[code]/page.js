@@ -1,11 +1,13 @@
 'use client';
 
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useCallback } from 'react';
 import { useRouter, useParams } from 'next/navigation';
 import Button from '@/components/Button';
 import Avatar from '@/components/Avatar';
 import { initializeSocket } from '@/lib/socket';
-import { Trophy, Users, Bell, Swords, Crown, ChevronRight, ShieldAlert } from 'lucide-react';
+import {
+  Trophy, Users, Bell, Swords, Crown, ChevronRight, ShieldAlert,
+} from 'lucide-react';
 
 export default function LeagueLobby() {
   const { code } = useParams();
@@ -15,76 +17,102 @@ export default function LeagueLobby() {
   const [notification, setNotification] = useState('');
   const router = useRouter();
 
+  const enterMatch = useCallback(
+    (matchData) => {
+      if (!matchData) return;
+      sessionStorage.setItem(
+        'leagueMatch',
+        JSON.stringify({
+          roomCode: matchData.roomCode,
+          opponentUsername: matchData.opponentUsername,
+          yourColor: matchData.yourColor,
+          leagueCode: code,
+          board: matchData.board,
+          currentPlayer: matchData.currentPlayer,
+        })
+      );
+      router.push(`/league/match?code=${code}&roomCode=${matchData.roomCode}`);
+    },
+    [code, router]
+  );
+
   useEffect(() => {
-    const init = async () => {
-      const s = await initializeSocket();
+    if (!code) return;
+    let mounted = true;
+    let s;
+
+    const setup = async () => {
+      s = await initializeSocket();
+      if (!mounted) return;
       setSocket(s);
 
+      // Initial fetch
       s.emit('getLeague', { code }, (data) => {
+        if (!mounted) return;
         if (data.error) {
-          setMessage(data.error);
+          setLeagueData((prev) => {
+            if (!prev) setMessage(data.error);
+            return prev;
+          });
         } else {
           setLeagueData(data);
+          setMessage('');
         }
       });
 
+      // Real-time updates
       s.on('leagueUpdate', (data) => {
-        if (data.code === code) {
-          setLeagueData(prev => ({
-            ...prev,
-            bracket: data.bracket || prev.bracket,
-            status: data.status || prev.status,
-            players: data.players || prev.players,
-            playerNames: data.playerNames || prev.playerNames,
-          }));
-        }
+        if (data.code !== code) return;
+        setLeagueData((prev) => ({
+          ...prev,
+          bracket: data.bracket || prev?.bracket,
+          status: data.status || prev?.status,
+          players: data.players || prev?.players,
+          playerNames: data.playerNames || prev?.playerNames,
+        }));
       });
 
+      // Match ready → auto-navigate
       s.on('leagueMatchReady', (data) => {
-        setNotification(`Your match is ready! Opponent: ${data.opponentUsername}`);
+        setNotification(`Match started! Opponent: ${data.opponentUsername}`);
+        // Fetch fresh match data then navigate
         s.emit('getLeague', { code }, (fresh) => {
-          if (fresh.myMatch) {
-            setLeagueData(prev => ({ ...prev, myMatch: fresh.myMatch }));
+          if (!mounted) return;
+          if (fresh?.myMatch) {
+            enterMatch(fresh.myMatch);
+          } else {
+            enterMatch({
+              roomCode: data.roomCode,
+              opponentUsername: data.opponentUsername,
+              yourColor: data.yourColor,
+            });
           }
         });
-        setTimeout(() => setNotification(''), 5000);
       });
 
+      // League complete
       s.on('leagueCompleted', (data) => {
         if (data.leagueCode === code) {
-          setLeagueData(prev => ({ ...prev, status: 'completed', champion: data.champion }));
+          setLeagueData((prev) => ({ ...prev, status: 'completed', champion: data.champion }));
         }
       });
+    };
 
-      return () => {
+    setup();
+
+    return () => {
+      mounted = false;
+      if (s) {
         s.off('leagueUpdate');
         s.off('leagueMatchReady');
         s.off('leagueCompleted');
-      };
+      }
     };
-    init();
-  }, [code, router]);
+  }, [code, enterMatch]);
 
   const playerNames = leagueData?.playerNames || {};
   const getPlayerName = (id) => playerNames[id] || id;
   const myMatch = leagueData?.myMatch;
-
-  const handlePlayMatch = () => {
-    if (myMatch) {
-      sessionStorage.setItem(
-        'leagueMatch',
-        JSON.stringify({
-          roomCode: myMatch.roomCode,
-          opponentUsername: myMatch.opponentUsername,
-          yourColor: myMatch.yourColor,
-          leagueCode: code,
-          board: myMatch.board,
-          currentPlayer: myMatch.currentPlayer,
-        })
-      );
-      router.push(`/league/match?code=${code}&roomCode=${myMatch.roomCode}`);
-    }
-  };
 
   const getRoundLabel = (index, totalRounds) => {
     if (index === totalRounds - 1) return 'Finals';
@@ -95,17 +123,11 @@ export default function LeagueLobby() {
 
   const symmetricBracket = useMemo(() => {
     if (!leagueData?.bracket || leagueData.bracket.length === 0) return null;
-
     const rounds = leagueData.bracket;
     const totalRounds = rounds.length;
 
     if (totalRounds === 1) {
-      return {
-        leftRounds: [],
-        finalMatch: rounds[0].matches[0],
-        rightRounds: [],
-        totalRounds,
-      };
+      return { leftRounds: [], finalMatch: rounds[0].matches[0], rightRounds: [], totalRounds };
     }
 
     const leftRounds = [];
@@ -114,29 +136,25 @@ export default function LeagueLobby() {
     for (let rIdx = 0; rIdx < totalRounds - 1; rIdx++) {
       const roundMatches = rounds[rIdx].matches || [];
       const half = Math.ceil(roundMatches.length / 2);
-
       leftRounds.push({
         title: getRoundLabel(rIdx, totalRounds),
         matches: roundMatches.slice(0, half),
       });
-
       rightRounds.push({
         title: getRoundLabel(rIdx, totalRounds),
         matches: roundMatches.slice(half),
       });
     }
 
-    const finalMatch = rounds[totalRounds - 1].matches[0];
-
     return {
       leftRounds,
-      finalMatch,
+      finalMatch: rounds[totalRounds - 1].matches[0],
       rightRounds,
       totalRounds,
     };
   }, [leagueData]);
 
-  if (message) {
+  if (message && !leagueData) {
     return (
       <div className="flex flex-col items-center justify-center min-h-[50vh] text-center p-6">
         <div className="bg-red-500/10 border border-red-500/30 rounded-2xl p-8 max-w-md backdrop-blur-md">
@@ -185,15 +203,10 @@ export default function LeagueLobby() {
           >
             <div className="flex items-center gap-1.5 md:gap-2 min-w-0">
               <Avatar src={null} size="xs" />
-              <span
-                className={`text-[10px] md:text-xs font-bold truncate ${
-                  match.winner === match.players?.[0]
-                    ? 'text-emerald-400'
-                    : match.players?.[0]
-                    ? 'text-slate-200'
-                    : 'text-slate-500 italic'
-                }`}
-              >
+              <span className={`text-[10px] md:text-xs font-bold truncate ${
+                match.winner === match.players?.[0] ? 'text-emerald-400'
+                : match.players?.[0] ? 'text-slate-200' : 'text-slate-500 italic'
+              }`}>
                 {match.players?.[0] ? player1Name : 'TBD'}
               </span>
             </div>
@@ -220,15 +233,10 @@ export default function LeagueLobby() {
           >
             <div className="flex items-center gap-1.5 md:gap-2 min-w-0">
               <Avatar src={null} size="xs" />
-              <span
-                className={`text-[10px] md:text-xs font-bold truncate ${
-                  match.winner === match.players?.[1]
-                    ? 'text-emerald-400'
-                    : match.players?.[1]
-                    ? 'text-slate-200'
-                    : 'text-slate-500 italic'
-                }`}
-              >
+              <span className={`text-[10px] md:text-xs font-bold truncate ${
+                match.winner === match.players?.[1] ? 'text-emerald-400'
+                : match.players?.[1] ? 'text-slate-200' : 'text-slate-500 italic'
+              }`}>
                 {match.players?.[1] ? player2Name : 'TBD'}
               </span>
             </div>
@@ -245,15 +253,13 @@ export default function LeagueLobby() {
 
   return (
     <div className="max-w-[1600px] mx-auto px-2 sm:px-4 py-4 md:py-6">
-      {/* Toast Notification */}
       {notification && (
-        <div className="fixed top-4 left-1/2 -translate-x-1/2 md:top-6 md:right-6 md:left-auto md:translate-x-0 bg-gradient-to-r from-yellow-400 to-amber-500 text-slate-950 font-bold px-4 md:px-5 py-2.5 md:py-3 rounded-xl shadow-2xl shadow-yellow-500/20 z-50 flex items-center gap-2 md:gap-3 animate-slide-in backdrop-blur-md border border-yellow-200 max-w-[90vw] md:max-w-md">
+        <div className="fixed top-4 left-1/2 -translate-x-1/2 md:top-6 md:right-6 md:left-auto md:translate-x-0 bg-gradient-to-r from-yellow-400 to-amber-500 text-slate-950 font-bold px-4 md:px-5 py-2.5 md:py-3 rounded-xl shadow-2xl z-50 flex items-center gap-2 md:gap-3 backdrop-blur-md border border-yellow-200 max-w-[90vw] md:max-w-md">
           <Bell className="w-4 h-4 md:w-5 md:h-5 animate-bounce" />
           <span className="text-sm md:text-base truncate">{notification}</span>
         </div>
       )}
 
-      {/* Header Banner */}
       <div className="relative overflow-hidden rounded-xl md:rounded-2xl bg-gradient-to-r from-slate-900 via-slate-800 to-slate-900 border border-slate-700/50 p-4 md:p-8 mb-6 md:mb-8 shadow-2xl">
         <div className="absolute top-0 right-0 -mt-8 -mr-8 w-48 md:w-64 h-48 md:h-64 bg-yellow-500/10 rounded-full blur-3xl pointer-events-none" />
         <div className="relative z-10 flex flex-col md:flex-row md:items-center justify-between gap-4 md:gap-6">
@@ -279,21 +285,19 @@ export default function LeagueLobby() {
             <div className="flex items-center">
               <Button
                 variant="primary"
-                onClick={handlePlayMatch}
-                className="w-full md:w-auto px-6 md:px-8 py-3 md:py-4 bg-gradient-to-r from-amber-400 via-yellow-400 to-amber-500 hover:from-amber-300 hover:to-yellow-400 text-slate-950 font-black text-base md:text-lg rounded-xl shadow-lg shadow-yellow-500/20 hover:shadow-yellow-500/40 transition-all duration-300 transform hover:-translate-y-0.5 flex items-center justify-center gap-2 md:gap-3 group"
+                onClick={() => enterMatch(myMatch)}
+                className="w-full md:w-auto px-6 md:px-8 py-3 md:py-4 bg-gradient-to-r from-amber-400 via-yellow-400 to-amber-500 hover:from-amber-300 hover:to-yellow-400 text-slate-950 font-black text-base md:text-lg rounded-xl shadow-lg shadow-yellow-500/20 transition-all duration-300 transform hover:-translate-y-0.5 flex items-center justify-center gap-2 md:gap-3 group"
               >
-                <Swords className="w-5 h-5 md:w-6 md:h-6 transition-transform group-hover:rotate-12" />
+                <Swords className="w-5 h-5 md:w-6 md:h-6" />
                 <span>ENTER MATCH</span>
-                <ChevronRight className="w-4 h-4 md:w-5 md:h-5 transition-transform group-hover:translate-x-1" />
+                <ChevronRight className="w-4 h-4 md:w-5 md:h-5" />
               </Button>
             </div>
           )}
         </div>
       </div>
 
-      {/* Main content: Bracket first on mobile, Roster second */}
       <div className="grid grid-cols-1 xl:grid-cols-4 gap-6 md:gap-8">
-        {/* Bracket - now first in DOM order for mobile */}
         <div className="xl:col-span-3 order-1 xl:order-2">
           <div className="bg-slate-900/80 backdrop-blur-md rounded-2xl border border-slate-800 p-3 md:p-6 shadow-xl">
             <div className="flex items-center gap-2 md:gap-3 mb-4 md:mb-6 pb-3 md:pb-4 border-b border-slate-800">
@@ -304,7 +308,6 @@ export default function LeagueLobby() {
             {symmetricBracket ? (
               <div className="overflow-x-auto pb-4 md:pb-6 scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-slate-900">
                 <div className="min-w-[720px] md:min-w-[900px] flex items-center justify-between gap-2 md:gap-4 py-2 md:py-4">
-                  {/* LEFT BRACKET WING */}
                   <div className="flex-1 flex gap-3 md:gap-6 justify-start">
                     {symmetricBracket.leftRounds.map((round, rIdx) => (
                       <div key={rIdx} className="flex-1 min-w-[140px] md:min-w-[180px] max-w-[180px] md:max-w-[220px] flex flex-col">
@@ -322,24 +325,20 @@ export default function LeagueLobby() {
                     ))}
                   </div>
 
-                  {/* CENTER FINALS & TROPHY DISPLAY */}
                   <div className="w-[180px] md:w-[240px] flex flex-col items-center justify-center shrink-0 px-1 md:px-2 my-auto">
                     <div className="text-center mb-2 md:mb-4">
                       <span className="px-3 md:px-4 py-1 md:py-1.5 rounded-xl bg-gradient-to-r from-amber-500/20 to-yellow-500/20 text-amber-400 border border-amber-500/40 text-[10px] md:text-xs font-black tracking-widest uppercase">
                         Finals
                       </span>
                     </div>
-
                     <div className="w-full relative">
-                      <div className="absolute -top-8 md:-top-12 left-1/2 -translate-x-1/2 w-16 md:w-24 h-16 md:h-24 bg-amber-400/10 blur-xl rounded-full pointer-events-none" />
                       <div className="flex justify-center mb-2 md:mb-3">
-                        <Trophy className="w-8 h-8 md:w-10 md:h-10 text-amber-400 animate-pulse drop-shadow-[0_0_10px_rgba(251,191,36,0.5)]" />
+                        <Trophy className="w-8 h-8 md:w-10 md:h-10 text-amber-400 animate-pulse" />
                       </div>
                       <MatchCard match={symmetricBracket.finalMatch} isFinal={true} />
                     </div>
                   </div>
 
-                  {/* RIGHT BRACKET WING */}
                   <div className="flex-1 flex gap-3 md:gap-6 justify-end">
                     {symmetricBracket.rightRounds.slice().reverse().map((round, rIdx) => (
                       <div key={rIdx} className="flex-1 min-w-[140px] md:min-w-[180px] max-w-[180px] md:max-w-[220px] flex flex-col">
@@ -357,10 +356,6 @@ export default function LeagueLobby() {
                     ))}
                   </div>
                 </div>
-                {/* Scroll hint for mobile */}
-                <div className="md:hidden text-center mt-2 text-slate-500 text-xs flex items-center justify-center gap-1">
-                  <ChevronRight className="w-3 h-3" /> Swipe horizontally to view full bracket
-                </div>
               </div>
             ) : (
               <div className="text-center py-12 md:py-16 px-4 bg-slate-950/40 rounded-xl border border-dashed border-slate-800">
@@ -371,7 +366,6 @@ export default function LeagueLobby() {
           </div>
         </div>
 
-        {/* Squad Roster */}
         <div className="xl:col-span-1 order-2 xl:order-1">
           <div className="bg-slate-900/80 backdrop-blur-md rounded-2xl border border-slate-800 p-4 md:p-5 shadow-xl">
             <div className="flex items-center justify-between pb-3 md:pb-4 mb-3 md:mb-4 border-b border-slate-800">
@@ -383,7 +377,7 @@ export default function LeagueLobby() {
                 {leagueData.players?.length || 0} / {leagueData.size}
               </span>
             </div>
-            
+
             <div className="space-y-2 md:space-y-2.5 max-h-[400px] md:max-h-[650px] overflow-y-auto pr-1">
               {leagueData.players?.map((playerId, idx) => {
                 const isChampion = leagueData.champion === playerId;
@@ -393,7 +387,7 @@ export default function LeagueLobby() {
                     className={`flex items-center justify-between p-2 md:p-3 rounded-lg md:rounded-xl border transition-all duration-200 ${
                       isChampion
                         ? 'bg-amber-500/10 border-amber-500/30'
-                        : 'bg-slate-800/50 hover:bg-slate-800 border-slate-800 hover:border-slate-700'
+                        : 'bg-slate-800/50 hover:bg-slate-800 border-slate-800'
                     }`}
                   >
                     <div className="flex items-center gap-2 md:gap-3 min-w-0">
@@ -412,10 +406,8 @@ export default function LeagueLobby() {
         </div>
       </div>
 
-      {/* Champion Banner */}
       {leagueData.status === 'completed' && leagueData.champion && (
         <div className="mt-6 md:mt-8 relative overflow-hidden bg-gradient-to-r from-amber-500/20 via-yellow-500/10 to-amber-500/20 border-2 border-amber-400/50 p-6 md:p-8 rounded-2xl text-center backdrop-blur-md shadow-2xl">
-          <div className="absolute inset-0 bg-yellow-400/5 blur-2xl pointer-events-none" />
           <div className="relative z-10 flex flex-col items-center">
             <div className="w-14 h-14 md:w-16 md:h-16 bg-amber-400/20 rounded-full flex items-center justify-center mb-2 md:mb-3 border border-amber-400/40">
               <Crown className="w-8 h-8 md:w-10 md:h-10 text-amber-400 animate-bounce" />

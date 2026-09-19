@@ -19,51 +19,36 @@ export default function OnlineBoard({
   myColor: initialMyColor,
   myUsername,
   opponentUsername,
-  isLeague = false,       // new prop
-  leagueCode = null,      // new prop
+  isLeague = false,
+  leagueCode = null,
 }) {
   const router = useRouter();
   const [board, setBoard] = useState(initialBoard || createInitialBoard());
-  const [currentPlayer, setCurrentPlayer] = useState(initialCurrentPlayer || PLAYER_RED);
-  const [myColor, setMyColor] = useState(initialMyColor);
-  const [roomCode, setRoomCode] = useState(initialRoomCode);
+  const [currentPlayer, setCurrentPlayer] = useState(initialCurrentPlayer ?? PLAYER_RED);
+  const [myColor, setMyColor] = useState(initialMyColor ?? PLAYER_RED);
+  const [roomCode] = useState(initialRoomCode);
   const [selectedPiece, setSelectedPiece] = useState(null);
   const [availableSequences, setAvailableSequences] = useState([]);
   const [moveSteps, setMoveSteps] = useState([]);
-  const [message, setMessage] = useState('');
+  const [message, setMessage] = useState('Your turn');
   const [gameOver, setGameOver] = useState(false);
   const [gameResult, setGameResult] = useState(null);
 
-  const boardRef = useRef(board);
-  const currentPlayerRef = useRef(currentPlayer);
-  const selectedPieceRef = useRef(selectedPiece);
-  const availableSequencesRef = useRef(availableSequences);
-  const moveStepsRef = useRef(moveSteps);
   const myColorRef = useRef(myColor);
-  const roomCodeRef = useRef(roomCode);
-  const gameOverRef = useRef(gameOver);
-
-  useEffect(() => { boardRef.current = board; }, [board]);
-  useEffect(() => { currentPlayerRef.current = currentPlayer; }, [currentPlayer]);
-  useEffect(() => { selectedPieceRef.current = selectedPiece; }, [selectedPiece]);
-  useEffect(() => { availableSequencesRef.current = availableSequences; }, [availableSequences]);
-  useEffect(() => { moveStepsRef.current = moveSteps; }, [moveSteps]);
-  useEffect(() => { myColorRef.current = myColor; }, [myColor]);
-  useEffect(() => { roomCodeRef.current = roomCode; }, [roomCode]);
-  useEffect(() => { gameOverRef.current = gameOver; }, [gameOver]);
-
   useEffect(() => {
-    if (initialCurrentPlayer === initialMyColor) {
-      setMessage('Your turn');
-    } else {
-      setMessage("Opponent's turn");
-    }
-  }, []);
+    myColorRef.current = myColor;
+  }, [myColor]);
 
+  // Sync state from server on mount and listen for updates
   useEffect(() => {
-    if (!socket) return;
+    if (!socket || !roomCode) return;
 
-    const handleMoveMade = ({ board: newBoard, currentPlayer: newTurn }) => {
+    // Ask server for current state (idempotent join + snapshot)
+    socket.emit('joinGameRoom', { roomCode }, (res) => {
+      if (res?.error) console.warn('joinGameRoom:', res.error);
+    });
+
+    const onMoveMade = ({ board: newBoard, currentPlayer: newTurn }) => {
       setBoard(newBoard);
       setCurrentPlayer(newTurn);
       setSelectedPiece(null);
@@ -72,38 +57,42 @@ export default function OnlineBoard({
       setMessage(newTurn === myColorRef.current ? 'Your turn' : "Opponent's turn");
     };
 
-    const handleGameState = ({ board: newBoard, currentPlayer: newTurn, myColor: newMyColor }) => {
-      setBoard(newBoard);
-      setCurrentPlayer(newTurn);
-      setMyColor(newMyColor);
+    const onGameState = ({ board: b, currentPlayer: cp, myColor: mc }) => {
+      if (b) setBoard(b);
+      if (typeof cp === 'number') setCurrentPlayer(cp);
+      if (typeof mc === 'number') {
+        setMyColor(mc);
+        myColorRef.current = mc;
+      }
       setSelectedPiece(null);
       setAvailableSequences([]);
       setMoveSteps([]);
-      setMessage(newTurn === newMyColor ? 'Your turn' : "Opponent's turn");
+      const activeColor = typeof mc === 'number' ? mc : myColorRef.current;
+      setMessage(cp === activeColor ? 'Your turn' : "Opponent's turn");
     };
 
-    const handleGameOver = ({ winner, reason }) => {
+    const onGameOver = ({ winner, reason }) => {
       setGameOver(true);
       setGameResult({ winner, reason });
       setMessage(`Game over! ${winner === myColorRef.current ? 'You win!' : 'You lose!'}`);
     };
 
-    const handlePlayerLeft = () => {
+    const onPlayerLeft = () => {
       setGameOver(true);
       setGameResult({ winner: 'opponent', reason: 'Opponent left' });
       setMessage('Opponent left the game');
     };
 
-    socket.on('moveMade', handleMoveMade);
-    socket.on('gameState', handleGameState);
-    socket.on('gameOver', handleGameOver);
-    socket.on('playerLeft', handlePlayerLeft);
+    socket.on('moveMade', onMoveMade);
+    socket.on('gameState', onGameState);
+    socket.on('gameOver', onGameOver);
+    socket.on('playerLeft', onPlayerLeft);
 
     return () => {
-      socket.off('moveMade', handleMoveMade);
-      socket.off('gameState', handleGameState);
-      socket.off('gameOver', handleGameOver);
-      socket.off('playerLeft', handlePlayerLeft);
+      socket.off('moveMade', onMoveMade);
+      socket.off('gameState', onGameState);
+      socket.off('gameOver', onGameOver);
+      socket.off('playerLeft', onPlayerLeft);
     };
   }, [socket, roomCode]);
 
@@ -116,21 +105,23 @@ export default function OnlineBoard({
 
     if (selectedPiece) {
       const matching = availableSequences.filter(
-        seq => seq.length > 0 && seq[0].to[0] === actualRow && seq[0].to[1] === actualCol
+        (seq) =>
+          seq.length > 0 &&
+          seq[0].to[0] === actualRow &&
+          seq[0].to[1] === actualCol
       );
       if (matching.length > 0) {
         const firstStep = matching[0][0];
-        const newBoard = applyMoveSequence(board, [firstStep]);
-        setBoard(newBoard);
+        setBoard(applyMoveSequence(board, [firstStep]));
         setSelectedPiece([firstStep.to[0], firstStep.to[1]]);
 
         const newSteps = [...moveSteps, firstStep];
         setMoveSteps(newSteps);
 
-        const suffixes = matching.map(seq => seq.slice(1));
+        const suffixes = matching.map((s) => s.slice(1));
         setAvailableSequences(suffixes);
 
-        if (suffixes.every(seq => seq.length === 0)) {
+        if (suffixes.every((s) => s.length === 0)) {
           socket.emit('move', { roomCode, steps: newSteps });
           setSelectedPiece(null);
           setAvailableSequences([]);
@@ -142,12 +133,16 @@ export default function OnlineBoard({
 
     if (piece && piece.player === myColor) {
       const moves = getValidMoves(board, myColor);
-      const pieceMoveSequences = moves
-        .filter(move => move.steps[0].from[0] === actualRow && move.steps[0].from[1] === actualCol)
-        .map(move => move.steps);
-      if (pieceMoveSequences.length > 0) {
+      const seqs = moves
+        .filter(
+          (m) =>
+            m.steps[0].from[0] === actualRow &&
+            m.steps[0].from[1] === actualCol
+        )
+        .map((m) => m.steps);
+      if (seqs.length > 0) {
         setSelectedPiece([actualRow, actualCol]);
-        setAvailableSequences(pieceMoveSequences);
+        setAvailableSequences(seqs);
         setMoveSteps([]);
       } else {
         setSelectedPiece(null);
@@ -161,32 +156,39 @@ export default function OnlineBoard({
     }
   };
 
-  const isTarget = (displayRow, displayCol) => {
+  const isTarget = (r, c) => {
     if (!selectedPiece || availableSequences.length === 0) return false;
-    const actualRow = myColor === PLAYER_RED ? displayRow : 7 - displayRow;
-    const actualCol = myColor === PLAYER_RED ? displayCol : 7 - displayCol;
-    return availableSequences.some(seq => seq.length > 0 && seq[0].to[0] === actualRow && seq[0].to[1] === actualCol);
+    const ar = myColor === PLAYER_RED ? r : 7 - r;
+    const ac = myColor === PLAYER_RED ? c : 7 - c;
+    return availableSequences.some(
+      (s) => s.length > 0 && s[0].to[0] === ar && s[0].to[1] === ac
+    );
   };
 
-  const isSelected = (displayRow, displayCol) => {
+  const isSelected = (r, c) => {
     if (!selectedPiece) return false;
-    const actualRow = myColor === PLAYER_RED ? displayRow : 7 - displayRow;
-    const actualCol = myColor === PLAYER_RED ? displayCol : 7 - displayCol;
-    return selectedPiece[0] === actualRow && selectedPiece[1] === actualCol;
+    const ar = myColor === PLAYER_RED ? r : 7 - r;
+    const ac = myColor === PLAYER_RED ? c : 7 - c;
+    return selectedPiece[0] === ar && selectedPiece[1] === ac;
   };
 
-  const renderSquare = (displayRow, displayCol) => {
-    const actualRow = myColor === PLAYER_RED ? displayRow : 7 - displayRow;
-    const actualCol = myColor === PLAYER_RED ? displayCol : 7 - displayCol;
-    const piece = board[actualRow]?.[actualCol];
-    const isDark = (displayRow + displayCol) % 2 === 1;
-    const selected = isSelected(displayRow, displayCol);
-    const target = isTarget(displayRow, displayCol);
+  const handleClose = () => {
+    if (isLeague && leagueCode) router.push(`/league/${leagueCode}`);
+    else router.push('/play');
+  };
+
+  const renderSquare = (r, c) => {
+    const ar = myColor === PLAYER_RED ? r : 7 - r;
+    const ac = myColor === PLAYER_RED ? c : 7 - c;
+    const piece = board[ar]?.[ac];
+    const isDark = (r + c) % 2 === 1;
+    const selected = isSelected(r, c);
+    const target = isTarget(r, c);
 
     return (
       <div
-        key={`${displayRow}-${displayCol}`}
-        onClick={() => handleSquareClick(displayRow, displayCol)}
+        key={`${r}-${c}`}
+        onClick={() => handleSquareClick(r, c)}
         className={`aspect-square w-full relative cursor-pointer
           ${isDark ? 'bg-dark-700' : 'bg-dark-800'}
           ${selected ? 'ring-2 ring-yellow-bright bg-yellow-bright/10' : ''}`}
@@ -197,25 +199,20 @@ export default function OnlineBoard({
           </div>
         )}
         {piece && (
-          <div className={`absolute inset-1 sm:inset-1.5 rounded-full flex items-center justify-center
-            ${piece.player === PLAYER_RED ? 'bg-red-600 border-red-300' : 'bg-slate-900 border-slate-500'}
-            border-2 shadow-lg`}
+          <div
+            className={`absolute inset-1 sm:inset-1.5 rounded-full flex items-center justify-center
+              ${piece.player === PLAYER_RED ? 'bg-red-600 border-red-300' : 'bg-slate-900 border-slate-500'}
+              border-2 shadow-lg`}
           >
             <div className="w-2/3 h-2/3 rounded-full border border-white/30 flex items-center justify-center">
-              {piece.king && <span className="text-yellow-bright text-sm sm:text-base">★</span>}
+              {piece.king && (
+                <span className="text-yellow-bright text-sm sm:text-base">★</span>
+              )}
             </div>
           </div>
         )}
       </div>
     );
-  };
-
-  const handleClose = () => {
-    if (isLeague && leagueCode) {
-      router.push(`/league/${leagueCode}`);
-    } else {
-      router.push('/play');
-    }
   };
 
   return (
@@ -227,7 +224,11 @@ export default function OnlineBoard({
       </div>
 
       <div className="mb-2 flex items-center gap-2 bg-dark-800 px-3 py-1 rounded-full border border-dark-600">
-        <div className={`h-2 w-2 rounded-full ${currentPlayer === myColor ? 'bg-green-500' : 'bg-red-500'}`} />
+        <div
+          className={`h-2 w-2 rounded-full ${
+            currentPlayer === myColor ? 'bg-green-500' : 'bg-red-500'
+          }`}
+        />
         <span className="text-white font-semibold text-sm">{message}</span>
       </div>
 
@@ -249,7 +250,9 @@ export default function OnlineBoard({
             <p className="text-gray-300 mb-2">
               {gameResult.winner === myColor ? 'You win!' : 'You lose!'}
             </p>
-            <p className="text-sm text-gray-400 mb-4">Reason: {gameResult.reason}</p>
+            <p className="text-sm text-gray-400 mb-4">
+              Reason: {gameResult.reason}
+            </p>
             <Button variant="primary" onClick={handleClose}>
               Close
             </Button>
